@@ -10,9 +10,12 @@ import numpy as np
 import json
 from pony.orm import *
 
+provider = "mysql"
+host = "127.0.0.1"
+user = "aomuse"
+passwd = "#aomuse2020"
+database_name = "newaomuse"
 
-# FITS filenames to be ignored
-ignore_list = ['PIXTABLE', 'MASTER', 'LINES', 'SKY', "STD_", "TRACE"]
 
 ##############################
 # Actual script operations start from here
@@ -47,9 +50,9 @@ class Exposure(db.Entity):
     prm_filename = Optional(str, unique=True)
     pampelmuse_params = Optional(Json)
     sources = Optional(Json)
-    psf_table = Optional(Json)
     pampelmuse_catalog = Optional(Json)
     raman_image_header = Optional(Json)
+    maoppy_data = Optional(Json)
 
     #   ----- Sky parameters -----
     sky_condition_start_time = Optional(float)
@@ -69,8 +72,7 @@ class Processed_Exposure(db.Entity):
     obs_id = Required(int, size=32, unsigned=True)
     insMode = Required(str)
     raw_filename = Optional(str, unique=True)
-    # ------- Maybe some of those can be grouped in one field like atm params ------
-    ngs_flux = Optional(float) # Not sure what data type it should be
+    ngs_flux = Optional(float)
     ttfree = Optional(bool)
     degraded = Optional(bool)
     glf = Optional(float)
@@ -126,12 +128,7 @@ def muse_script():
     new_entries = 0
     modified_entries = 0
     not_modified = 0
-    rootDir = "/qc/opsproj2/aomuse/aomuse/wfmao/P101"
-    default = input("Use default root directory?\n1.- Yes\n2.- No\n")
-    if(default == "2"):
-        rootDir = input("Enter the root directory: ") # rootDir: directory where are the 3 folders (single, raw and analysis)
-    else:
-        print(f"Using default root directory: {rootDir}")
+    rootDir = input("Enter the root directory: ")
     singleDir = rootDir + '/single/' # Reduced files
     rawDir = rootDir + '/raw/' # Raw files
     analysisDir = rootDir + '/analysis/' # Prm and psf files
@@ -149,6 +146,7 @@ def muse_script():
     catalog_count = 0
     nightlog_count = 0
     raman_count = 0
+    prm_count = 0
 
     start = time.time()
     logging.info("Listing single files directories...")
@@ -184,7 +182,6 @@ def muse_script():
     logging.info(f"{catalog_count} catalog files found.")
     print(f"{catalog_count} catalog files found.\n")
 
-    start = time.time()
     logging.info("Listing raman files directories...")
     print("Listing raman files directories...")
     time.sleep(0.1)  # Makes the terminal output pretty
@@ -198,6 +195,31 @@ def muse_script():
             pass
     logging.info(f"{raman_count} raman files found.")
     print(f"{raman_count} raman files found.\n")
+
+    folders = os.listdir(analysisDir)
+    analysisDir_moffat = ""
+    analysisDir_maoppy = ""
+    for folder in folders:
+        if("moffat" in folder):
+            analysisDir_moffat = analysisDir + folder + "/"
+        elif("maoppy" in folder):
+            analysisDir_maoppy = analysisDir + folder + "/"
+    NFM = True
+    if(analysisDir_moffat == "" or analysisDir_maoppy == ""):
+        NFM = False
+    prm_files = {}
+    if(NFM):
+        logging.info("NFM exposures found")
+        print("NFM exposures found")
+        logging.info("Listing prm files directories...")
+        print("Listing prm files directories...")
+        time.sleep(0.1)  # Makes the terminal output pretty
+        for filepath in tqdm(list(Path(analysisDir_maoppy).rglob('*.prm.fits'))):
+            prm_files[filepath.name] = filepath
+            prm_count += 1
+        logging.info(f"{single_count} prm files found.")
+        print(f"{single_count} prm files found.\n")
+
     end = time.time()
     print('{:.3f}'.format(end-start) + " seconds to finish file search\n")
     # ----- Analysis Folder -----
@@ -207,23 +229,18 @@ def muse_script():
     start = time.time()
     logging.info("Iterating analysis folder for prm files...")
     print("Creating/updating and storing exposure objects into the database")
-    prm_fits = list(Path(analysisDir).rglob('*prm*.fits'))
+    
+        
+    if(NFM):
+        prm_fits = list(Path(analysisDir_moffat).rglob('*prm*.fits'))
+    else:
+        prm_fits = list(Path(analysisDir).rglob('*prm*.fits'))
     warnings = 0
     for prm_file in tqdm(prm_fits):
 
         observation_dictionary = {}
-
-        moffat = False
-        maoppy = False
         prm_filename = prm_file.name
-        if("moffat" in prm_filename):
-            moffat = True
-            expected_cube_name = prm_filename[:29]+".fits"
-        elif("maoppy" in prm_filename):
-            maoppy = True
-            expected_cube_name = prm_filename[:29]+".fits"
-        else:
-            expected_cube_name = prm_filename.replace('.prm', '')
+        expected_cube_name = prm_filename.replace('.prm', '')
 
         # ----- Single Folder -----
 
@@ -419,16 +436,93 @@ def muse_script():
                         logging.warning(expected_psf_file.name + " Possibly a bad psf file, PM_* layers are missing")
                         warnings += 1
             except FileNotFoundError:
-                logging.warning("The file " + str(expected_psf_file) + " does not exist.")
+                logging.warning("The file " + str(expected_psf_file.name) + " does not exist.")
                 warnings += 1
-                print(f"The file {expected_psf_file} does not exist\n")  # If the psf file does not exists, skip
+                print(f"The file {expected_psf_file.name} does not exist\n")  # If the psf file does not exists, skip
                 sources = None
             except Exception as e:
-                logging.warning(str(expected_psf_file) + " " + str(e))
+                logging.warning(str(expected_psf_file.name) + " " + str(e))
                 warnings += 1
                 sources = None
 
             observation_dictionary['sources'] = sources
+
+        if(NFM):
+            # Maoppy PRM File
+            psfParams = {}  # Dictionary to store the extensions of the prm files
+            observation_dictionary["maoppy_data"] = {}
+            try:
+                maoppy_filepath = prm_files[prm_file.name]
+                with fits.open(maoppy_filepath) as hduList:
+
+                    try:
+                        params = hduList['PSFPARS'].data  # If the prm file does not have the PSFPARS extension, skip
+                    except KeyError:
+                        logging.warning("Maoppy " + prm_filename + " Could not find PSFPARS in header. Possibly a broken prm file, skipping file.")
+                        warnings += 1
+                        psfParams = None
+                    if(psfParams != None):
+                        try:
+                            for i in range(len(params['name'])):  # The column 'name' is a list with the parameter names
+                                parameter = params['name'][i]
+                                value = params['polyfit'][i].tolist()  # The column 'polyfit' is a list of lists
+                                psfParams[parameter] = value  # Store the polyfit of the PSF parameters
+                            prmStep = hduList['SPECTRA'].header['CDELT3']
+                            prmRestw = hduList['SPECTRA'].header['CRVAL3']
+                            prmData = np.arange(hduList['SPECTRA'].header['NAXIS3'])  # Calculate the wavelength
+                            prmWavelength = (prmRestw + (prmData * prmStep)) * 10 ** 9
+                            psfParams['wavelength'] = prmWavelength.tolist()
+                        except Exception as e:
+                            print("Maoppy " + str(prm_file) + " " + str(e))
+                            logging.warning("Maoppy " + str(prm_file) + " " + str(e))
+                            warnings += 1
+                            psfParams = None
+            except FileNotFoundError:
+                logging.warning("The file " + "Maoppy " + str(prm_filename) + " does not exist.")
+                warnings += 1
+                print(f"The file Maoppy {prm_filename} does not exist\n")  # If the prm file does not exists, skip
+                psfParams = None
+                prm_filename = None
+            except Exception as e:
+                logging.warning("Maoppy " + str(prm_filename) + " " + str(e))
+                warnings += 1
+                psfParams = None
+                prm_filename = None
+
+            observation_dictionary["maoppy_data"]['pampelmuse_params'] = psfParams
+            observation_dictionary["maoppy_data"]['prm_filename'] = prm_filename
+
+            # Maoppy PSF File
+        
+            sources = {}  # Dictionary to store the extensions (each source) of the psf files
+            expected_psf_file = str(maoppy_filepath).replace('.prm', '.psf')
+            try:
+                with fits.open(expected_psf_file) as hduList:
+                    for tupla in hduList.info(False):  # Iterate in the list of the extensions
+                        if ('PM_' in tupla[1]):  # Looking for the 'PM_X' extensions, where X is the id of the source
+                            sourceID = tupla[1]
+                            sourceData = {}  # Dictionary that will store the data of the source
+                            table = hduList[sourceID].data  # Access to the source extension
+                            i = 0
+                            for column in table.columns.names:  # Iterate in the list of column names
+                                sourceData[column] = table[column].tolist()  # Store the column with its list of values
+                                i += 1
+                            sources[sourceID] = sourceData  # Store the source data
+                    if sources == {}:
+                        print("Possibly a bad Maoppy psf file, no sources.")
+                        logging.warning("Maoppy " + expected_psf_file.name + " Possibly a bad psf file, PM_* layers are missing")
+                        warnings += 1
+            except FileNotFoundError:
+                logging.warning("The file " + "Maoppy " + str(expected_psf_file.name) + " does not exist.")
+                warnings += 1
+                print(f"The file Maoppy {expected_psf_file.name} does not exist\n")  # If the psf file does not exists, skip
+                sources = None
+            except Exception as e:
+                logging.warning("Maoppy " + str(expected_psf_file.name) + " " + str(e))
+                warnings += 1
+                sources = None
+
+            observation_dictionary["maoppy_data"]['sources'] = sources
 
     
         if(new_expo or read_raw):

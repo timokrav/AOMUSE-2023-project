@@ -29,9 +29,9 @@ class Exposure(db.Entity):
     prm_filename = Optional(str, unique=True)
     pampelmuse_params = Optional(Json)
     sources = Optional(Json)
-    psf_table = Optional(Json)
     pampelmuse_catalog = Optional(Json)
     raman_image_header = Optional(Json)
+    maoppy_data = Optional(Json)
 
     #   ----- Sky parameters -----
     sky_condition_start_time = Optional(float)
@@ -79,7 +79,7 @@ class Processed_Exposure(db.Entity):
 
 #   ----- Main -----
 
-db.bind(provider="mysql", host="127.0.0.1", user=user, passwd=passwd, db=database_name) # Establish the conection with the database
+db.bind(provider='mysql', host='127.0.0.1', user='aomuse', passwd='#aomuse2020', db='newaomuse') # Establish the conection with the database
 db.generate_mapping() # Map the classes with the database tables 
 db.drop_all_tables(with_all_data = True) # Delete all the tables
 
