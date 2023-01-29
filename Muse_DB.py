@@ -5,17 +5,27 @@ from datetime import datetime
 import os
 from astropy.io import fits
 from astropy.table import Table
+from astropy.utils.exceptions import AstropyWarning
 from tqdm import tqdm
 import numpy as np
 import json
 from pony.orm import *
+import pymysql
+import warnings
 
+provider = "mysql"
+host = "scdevdb1.sc.eso.org"
+user = "aomuse"
+passwd = "a0mu53!"
+database_name = "aomuse"
+
+"""
 provider = "mysql"
 host = "127.0.0.1"
 user = "aomuse"
 passwd = "#aomuse2020"
-database_name = "newaomuse"
-
+database_name = "timotest"
+"""
 
 ##############################
 # Actual script operations start from here
@@ -46,8 +56,8 @@ class Exposure(db.Entity):
     datacube_header = Optional(Json)
     raw_exposure_header = Optional(Json)
     raw_exposure_data = Optional(Json)
-    raw_exposure_filename = Optional(str, unique=True)
-    prm_filename = Optional(str, unique=True)
+    raw_exposure_filename = Optional(str)
+    prm_filename = Optional(str)
     pampelmuse_params = Optional(Json)
     sources = Optional(Json)
     pampelmuse_catalog = Optional(Json)
@@ -71,7 +81,7 @@ class Processed_Exposure(db.Entity):
     observation_time = Required(datetime, unique=True)
     obs_id = Required(int, size=32, unsigned=True)
     insMode = Required(str)
-    raw_filename = Optional(str, unique=True)
+    raw_filename = Optional(str)
     ngs_flux = Optional(float)
     ttfree = Optional(bool)
     degraded = Optional(bool)
@@ -107,6 +117,7 @@ def fetch_data(header, keyword):
 
 # This method converts an np.int64 to python native int, because the json library
 # at the moment cannot deal with numpy int64
+# N.B. I think numpy numbers are now deprecated, so this might not do anything anymore. - Timo 18/01/23
 def convert_npint64_to_int(o):
     if isinstance(o, np.int64):
         return int(o)
@@ -115,15 +126,16 @@ def convert_npint64_to_int(o):
 
 @db_session  # Decorator from Pony to make the function into a db session, thus the database can be modified
 def muse_script():
-    """
-    This function read 5 files (prm, psf, reduced, raman and raw) to store the information of each exposure in a database.
-
-    For the prm file reads the PSFPARS extension and stores it in the 'psfParams' field of the exposure.
-    For the psf file reads the 'PM_X' extensions, where X is the id of the source, and stores it in the
-    'sources' field of the exposure.
-    With other files the scripts takes the headers and saves them as json-like LongStr
-    Also, from the primary header it stores the target and instrument mode of the exposure in their own fields    to make it easier the analysis from differents targets and instrument modes.
-    """
+    ##############################
+    # This function read 5 files (prm, psf, reduced, raman and raw) to store the information of each exposure in a database.
+    #
+    # For the prm file reads the PSFPARS extension and stores it in the 'psfParams' field of the exposure.
+    # For the psf file reads the 'PM_X' extensions, where X is the id of the source, and stores it in the
+    # 'sources' field of the exposure.
+    # With other files the scripts takes the headers and saves them as json-like LongStr
+    # Also, from the primary header it stores the target and instrument mode of the exposure in their own fields
+    # to make it easier the analysis from differents targets and instrument modes.
+    ##############################
 
     new_entries = 0
     modified_entries = 0
@@ -132,6 +144,7 @@ def muse_script():
     singleDir = rootDir + '/single/' # Reduced files
     rawDir = rootDir + '/raw/' # Raw files
     analysisDir = rootDir + '/analysis/' # Prm and psf files
+    catalogDir = rootDir + '/cats/' # SExtractor files
 
     # Store the directories to find it later by the namefile quickly, since each file is inside a date format folder
 
@@ -177,7 +190,7 @@ def muse_script():
     print("Listing catalog files directories...")
     time.sleep(0.1)  # Makes the terminal output pretty
     for filepath in tqdm(list(Path(rootDir).rglob("*.detections.cat"))):
-        catalog_files[filepath.name[:29]+".fits"] = filepath
+        catalog_files[filepath.name.split("_")[0] + '.fits'] = filepath
         catalog_count += 1
     logging.info(f"{catalog_count} catalog files found.")
     print(f"{catalog_count} catalog files found.\n")
@@ -186,6 +199,7 @@ def muse_script():
     print("Listing raman files directories...")
     time.sleep(0.1)  # Makes the terminal output pretty
     for filepath in tqdm(list(Path(rootDir).rglob("*.fits"))):
+        break # REMOVE ME
         try:
             header = fits.getheader(filepath)
             if 'HIERARCH ESO PRO CATG' in header and header['HIERARCH ESO PRO CATG'] == "RAMAN_IMAGES":
@@ -238,6 +252,8 @@ def muse_script():
     warnings = 0
     for prm_file in tqdm(prm_fits):
 
+        logging.info(f"Manipulating file {prm_file}")
+
         observation_dictionary = {}
         prm_filename = prm_file.name
         expected_cube_name = prm_filename.replace('.prm', '')
@@ -248,7 +264,10 @@ def muse_script():
 
         try:
             cube_parameters = {}
+            logging.info(f"Attempting to guess the cube name {single_files[expected_cube_name]}")
             header = fits.getheader(single_files[expected_cube_name])
+            logging.info(f"Found a corresponding cube and header.")
+            
             try:
                 target = header['OBJECT']  # Obtain the target name
             except KeyError:
@@ -256,11 +275,17 @@ def muse_script():
                 warnings += 1
                 print("The header OBJECT does not exist")
                 continue
-            if Target.exists(target_name=target):  # If the target already exists in the database, get it from the db
-                cube_parameters['target'] = Target.get(target_name=target)
+            logging.info(f"Testing target {target} existence...")
+            target_exists = db.exists("select id from target where target_name=$target")
+            logging.info(f"Test complete.")
+            if target_exists:
+                logging.info(f"Fetching the target...")
+                cube_parameters['target'] = Target.get_by_sql(f"select * from target where target_name = '{target}'")
             else:
+                logging.info(f"Generating a new target...")
                 cube_parameters['target'] = Target(target_name=target)  # Else, create the target
-
+            logging.info(f"Successful test.")
+            
             try:
                 cube_parameters['observation_time'] = header['DATE-OBS']
             except KeyError:
@@ -301,11 +326,10 @@ def muse_script():
         except Exception as e:
             logging.warning(f"Error trying to get header of reduced file {expected_cube_name}. Error: {e}")
             warnings += 1
-            print(f"Error trying to get header of reduced file {expected_cube_name}. Error: {e}")
             continue
 
         observation_dictionary['target'] = cube_parameters['target'] 
-        observation_dictionary['observation_time'] = cube_parameters['observation_time']
+        observation_dictionary['observation_time'] = cube_parameters['observation_time'][:-4]
         observation_dictionary["obs_id"] = cube_parameters["obs_id"]
         observation_dictionary['insMode'] = cube_parameters['instrument_mode']
         observation_dictionary['datacube_header'] = dict(header)
@@ -320,6 +344,7 @@ def muse_script():
 
         observation_dictionary['raw_exposure_filename'] = raw_filename
 
+		# These flags decide what file extractions will be done
         new_expo = False
         read_raw = False
         read_prm = False
@@ -329,10 +354,18 @@ def muse_script():
         read_raman = False
 
         # Check if exposure exists, create a new exposure if not and modify existing one if needed
-        if not Exposure.exists(observation_time=observation_dictionary['observation_time']):
+        logging.info(f"Finished with the header, starting with the exposure.")
+        
+        logging.info(f"Testing existence of {observation_dictionary['observation_time']}")
+        logging.info(prm_filename)
+        exposure_exists = db.exists("select id from exposure where observation_time = $observation_dictionary['observation_time']")
+        
+        if not exposure_exists:
+            logging.info("Didn't find the exposure in database")
             new_expo = True
         else:
-            database_entry = Exposure.get(observation_time=observation_dictionary['observation_time'])
+            logging.info("Did find the exposure in database, retrieving...")
+            database_entry = Exposure.get_by_sql("select * from exposure where observation_time = $observation_dictionary['observation_time']")
             raw_attr = ["raw_exposure_header", "raw_exposure_data", "raw_exposure_filename"]
             prm_attr = ["prm_filename", "pampelmuse_params"]
             nightlog_attr = [
@@ -343,6 +376,7 @@ def muse_script():
                 "sky_condition_end",
                 "sky_comment_end"]
 
+            # Cycles through columns associated with different files. If they have empty entries, they should be reread.
             for attr in raw_attr:
                 database_value = getattr(database_entry, attr)
                 if(database_value == 'null' or database_value == None or database_value == ""):
@@ -368,9 +402,11 @@ def muse_script():
                     read_nightlog = True
                     break
 
+        # Nothing needs to be modified so we can move on to the next file
         if(not new_expo and not read_raw and not read_prm and not read_catalog and not read_nightlog and not read_raman):
             not_modified += 1
             continue
+            
         # PRM File
         # Notice that single file has the same root name that prm file
         if(new_expo or read_prm):
@@ -438,10 +474,10 @@ def muse_script():
             except FileNotFoundError:
                 logging.warning("The file " + str(expected_psf_file.name) + " does not exist.")
                 warnings += 1
-                print(f"The file {expected_psf_file.name} does not exist\n")  # If the psf file does not exists, skip
+                print(f"The file {expected_psf_file} does not exist\n")  # If the psf file does not exists, skip
                 sources = None
             except Exception as e:
-                logging.warning(str(expected_psf_file.name) + " " + str(e))
+                logging.warning(f"{expected_psf_file} {str(e)}")
                 warnings += 1
                 sources = None
 
@@ -531,12 +567,16 @@ def muse_script():
             #######################################
 
             raw_parameters = {}
+
+            logging.info("Raw exposure start.")
+            data = {}
                 
             # SGS and SPARTA header extraction    
             try:
-                data = {}
+                #data = {}
                 flag = False # Flag not relevant, just to print the \n before a missed extension
-                with fits.open(raw_files[raw_filename]) as hduList: 
+                with fits.open(raw_files[raw_filename]) as hduList:
+                    observation_dictionary['raw_exposure_filename'] = raw_filename 
                     try:
                         header = hduList[0].header
                     except Exception as e:
@@ -611,17 +651,19 @@ def muse_script():
                 logging.warning("The file {raw_filename} does not exist\n") # If the raw file does not exists, skip
                 warnings += 1
                 header = None 
-                data = None
+                data = {"error": "FileNotFound"}
                 raw_filename = None
             except Exception as e:
                 logging.warning(f"Error at reading raw file {raw_filename}")
                 warnings += 1
                 header = None 
-                data = None
+                data = {"error": f"{e}"}
                 raw_filename = None
             if(header != None):
                 observation_dictionary['raw_exposure_header']  = dict(header)
-            observation_dictionary['raw_exposure_filename'] = raw_filename
+            logging.info("Dumping variable 'data'...")
+            logging.info(type(data))
+            logging.info(data)
             observation_dictionary['raw_exposure_data']  = data
             try:
                 del observation_dictionary['raw_exposure_header']['COMMENT']  # and then delete the COMMENT key, because it does not have the JSON format and
@@ -642,17 +684,24 @@ def muse_script():
         if(new_expo or read_catalog):
             catalog_filename = expected_cube_name
             try:
+                with open(catalog_files[catalog_filename], "r") as cat_file:
+                    catalog_text = cat_file.read()
+
+                cat_dict = {'catalog': catalog_text.replace("\'", "").replace("\n", "\\n")}
+                
+                """
                 catalog_table = Table.read(catalog_files[catalog_filename], format="ascii.ecsv")
                 catalog_array = np.asarray(catalog_table)
                 list_of_cat_entries = []
                 for i in range(catalog_array.shape[0]):
                     entry_dict = {k: v for k, v in zip(catalog_array[i].dtype.names, catalog_array[i])}
                     list_of_cat_entries.append(entry_dict)
+                """
             except Exception as e:
                 logging.warning(f"{catalog_filename} cannot open {e}")
                 warnings += 1
                 list_of_cat_entries = None
-            observation_dictionary['pampelmuse_catalog'] = list_of_cat_entries
+            observation_dictionary['pampelmuse_catalog'] = cat_dict
 
         ##############################
         # Nightlog starts here
@@ -662,16 +711,15 @@ def muse_script():
             try:
                 with open(nightlog_files[raw_filename]) as f:
                     read_lines = f.readlines()
-            except FileExistsError:
+            except (FileExistsError, KeyError):
                 logging.warning("Nightlog file for " + expected_cube_name + " not found.")
                 warnings += 1
-                print("Nightlog file for " + expected_cube_name + " not found.")
-                start_weather_time = None
-                observation_start_condition = None
-                observation_start_comment = None
-                end_weather_time = None
-                observation_end_condition = None
-                observation_end_comment = None
+                start_weather_time = -1
+                observation_start_condition = "None"
+                observation_start_comment = "None"
+                end_weather_time = -1
+                observation_end_condition = "None"
+                observation_end_comment = "None"
                 skip = True
 
             if(not skip):
@@ -681,12 +729,12 @@ def muse_script():
                 except Exception as e:
                     logging.warning(raw_filename + " " + str(e))
                     warnings += 1
-                    start_weather_time = None
-                    observation_start_condition = None
-                    observation_start_comment = None
-                    end_weather_time = None
-                    observation_end_condition = None
-                    observation_end_comment = None
+                    start_weather_time = -1
+                    observation_start_condition = "None"
+                    observation_start_comment = "None"
+                    end_weather_time = -1
+                    observation_end_condition = "None"
+                    observation_end_comment = "None"
                     skip = True
 
                 if(not skip):
@@ -757,12 +805,12 @@ def muse_script():
                     except Exception as e:
                         logging.warning("Nightlog for " + expected_cube_name + " " + str(e))
                         warnings += 1
-                        start_weather_time = None
-                        observation_start_condition = None
-                        observation_start_comment = None
-                        end_weather_time = None
-                        observation_end_condition = None
-                        observation_end_comment = None
+                        start_weather_time = -1
+                        observation_start_condition = "None"
+                        observation_start_comment = "None"
+                        end_weather_time = -1
+                        observation_end_condition = "None"
+                        observation_end_comment = "None"
 
             observation_dictionary["sky_condition_start_time"] = start_weather_time
             observation_dictionary["sky_condition_start"] = observation_start_condition
@@ -792,7 +840,7 @@ def muse_script():
                 observation_dictionary['raman_image_header'] = None
             # Modify headers and tables into more JSON-like format
             if 'pampelmuse_catalog' in observation_dictionary:
-                observation_dictionary['pampelmuse_catalog'] = json.dumps(observation_dictionary['pampelmuse_catalog'], default=convert_npint64_to_int)
+                observation_dictionary['pampelmuse_catalog'] = json.dumps(observation_dictionary['pampelmuse_catalog'])#, default=convert_npint64_to_int)
             if 'pampelmuse_params' in observation_dictionary:
                 observation_dictionary['pampelmuse_params'] = json.dumps(observation_dictionary['pampelmuse_params'])
             if 'sources' in observation_dictionary:
@@ -807,15 +855,72 @@ def muse_script():
                 observation_dictionary['datacube_header'] = json.dumps(observation_dictionary['datacube_header'])
 
         if new_expo:
+            logging.info("Adding a new exposure...")
             Exposure(**observation_dictionary)
+            db.commit()
             new_entries += 1
+            logging.info("Done!")
         else:
-            logging.info("Modifying an entry with observation time " + observation_dictionary['observation_time'])
-            database_entry.set(**observation_dictionary)
-            modified_entries += 1
+            try:
+                entry_id = database_entry.id
+                logging.info("Modifying an entry with observation time " + observation_dictionary['observation_time'])
+                logging.info("observations dictionary:")
+                logging.info(observation_dictionary.keys())
+                
+                # We will remove some fhe entries from the dictionary, they should not be changed in any event.
+                if 'target' in observation_dictionary.keys():
+                    del observation_dictionary['target']
+                if 'observation_time' in observation_dictionary.keys():
+                    del observation_dictionary['observation_time']
+                if 'obs_id' in observation_dictionary.keys():
+                    del observation_dictionary['obs_id']
+                if 'insMode' in observation_dictionary.keys():
+                    del observation_dictionary['insMode']
+                if 'datacube_header' in observation_dictionary.keys():
+                    del observation_dictionary['datacube_header']
 
-    print(f"Finished updating the database, {new_entries} new entries, {modified_entries} modified entries and {not_modified} not modified entries.")
-    logging.info(f"Finished updating the database, {new_entries} new entries, {modified_entries} modified entries and {not_modified} not modified entries.")
+                # Create a pymysql connection to the database and start changing the values
+                connection = pymysql.connections.Connection(host=host, user=user, password=passwd, database=database_name)
+                cursor = connection.cursor()
+                
+                entry_modified = False
+                for key, value in observation_dictionary.items():
+                    # Sanity check, so we don't accidentally overwrite old good with an empty entry. This might happen if there is
+                    # e.g. a pampelmuse file with no other associated files.
+                    if value == None:
+                        continue
+                    if value == "None":
+                        continue
+                    if value == "null":
+                        continue
+                    if value == {}:
+                        continue
+                    if "fits.fz" in value:
+                        continue
+                    if value == "prm.fits" in value:
+                        continue
+                    if value == -1:
+                        continue
+                    try:
+                        logging.info(f"Editing column {key} with phrase:")
+                        logging.info(f"UPDATE exposure SET {key} = '{value}' WHERE id = {entry_id}")
+                        cursor.execute(f"UPDATE exposure SET {key} = '{value}' WHERE id = {entry_id}")
+                        entry_modified = True
+                    except Exception as e:
+                        logging.info("Encountered an error during update.")
+                        logging.info(e)
+                
+                logging.info("Trying to commit...")
+                connection.commit()
+                if entry_modified:
+                    modified_entries += 1
+                logging.info("Done!")
+            except Exception as e:
+                logging.info("Commit caused an error")
+                logging.info(e)
+
+    print(f"Finished updating the database, {new_entries} new entries, {modified_entries} modified entries and {not_modified} unmodified entries.")
+    logging.info(f"Finished updating the database, {new_entries} new entries, {modified_entries} modified entries and {not_modified} unmodified entries.")
     end = time.time()
     print(f"{warnings} warnings registered.")
     if(warnings > 0):
@@ -833,7 +938,9 @@ logging.basicConfig(filename=log_filename,
                     level=logging.INFO)
 print("Started a logfile called " + log_filename)
 try:
-    db.bind(provider="mysql", host="127.0.0.1", user=user, passwd=passwd, db=database_name)
+    sql_debug(True)
+    warnings.simplefilter('ignore', category=AstropyWarning)
+    db.bind(provider=provider, host=host, user=user, passwd=passwd, db=database_name)
     db.generate_mapping(check_tables=False, create_tables=True)
     logging.info("Connected to SQL database successfully.")
 except Exception as e:
