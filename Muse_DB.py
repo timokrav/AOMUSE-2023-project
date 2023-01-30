@@ -14,10 +14,10 @@ import pymysql
 import warnings
 
 provider = "mysql"
-host = "scdevdb1.sc.eso.org"
-user = "aomuse"
-passwd = "a0mu53!"
-database_name = "aomuse"
+host = "host"
+user = "user"
+passwd = "passwd"
+database_name = "db_name"
 
 """
 provider = "mysql"
